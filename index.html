@@ -65,7 +65,8 @@ const INITIAL_REAL_WAGE = 1000;
 // =========================================================
 // 日付・localStorage ユーティリティ
 // =========================================================
-const getTodayStr = () => new Date().toISOString().split("T")[0];
+const toLocalDateStr = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const getTodayStr = () => toLocalDateStr(new Date());
 const getNowHHMM = () => {
   const d = new Date();
   return `${d.getHours().toString().padStart(2,"0")}:${d.getMinutes().toString().padStart(2,"0")}`;
@@ -348,12 +349,38 @@ const WEEKLY_CHALLENGES = [
 // =========================================================
 // 起動時／復帰時オフライン差分を同期計算
 // =========================================================
+const hhmmOf = (d) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+const hhmmToMin = (t) => { const [h, m] = (t || "0:0").split(":").map(Number); return h * 60 + m; };
+
+// 慣性ボーナスの段階を引き継ぎながらオフラインEXPを区分積分
+const integrateInvestExp = (m0, dur, baseMult, actMult) => {
+  let sec = 0, exp = 0, m = m0;
+  while (sec < dur) {
+    const mult = m >= 7200 ? 2.0 : m >= 5400 ? 1.5 : m >= 3300 ? 1.2 : m >= 1500 ? 1.1 : 1.0;
+    const nextTh = m >= 7200 ? Infinity : m >= 5400 ? 7200 : m >= 3300 ? 5400 : m >= 1500 ? 3300 : 1500;
+    const step = Math.min(dur - sec, nextTh - m);
+    exp += (20 / 60) * baseMult * mult * actMult * step;
+    sec += step; m += step;
+  }
+  return exp;
+};
+
 const computeOfflineDelta = (saved) => {
   const base = {
     categoryTimes: saved?.categoryTimes ?? { investment: 0, labor: 0, recovery: 0, waste: 0, reward_time: 0 },
+    activityTimes: saved?.activityTimes ?? {},
+    todoTimes: saved?.todoTimes ?? {},
     receiptHistory: saved?.receiptHistory ?? {},
     laborAssets: saved?.laborAssets ?? 0,
+    rewardSavings: saved?.rewardSavings ?? 0,
+    exp: saved?.exp ?? 0,
+    level: saved?.level ?? 1,
+    momentumSeconds: saved?.momentumSeconds ?? 0,
+    lifetimeInvestSec: saved?.lifetimeInvestSec ?? (saved?.categoryTimes?.investment ?? 0),
+    unlockedTitles: saved?.unlockedTitles ?? [],
+    scheduleBlocks: (saved?.scheduleBlocks ?? []).map((b, i) => (b.id ? b : { ...b, id: `block_fix_${Date.now()}_${i}` })),
     needsMorning: false,
+    morningLastSeen: saved?.lastSeenAt ?? null,
     offlineNotice: null,
   };
   if (!saved?.lastSeenAt) return base;
@@ -380,23 +407,79 @@ const computeOfflineDelta = (saved) => {
 
   const todayStr = getTodayStr();
   const nextTimes = { ...base.categoryTimes, [cat]: (base.categoryTimes[cat] || 0) + diffSeconds };
-  const nextHistory = { ...base.receiptHistory, [todayStr]: nextTimes };
-  const nextLabor = cat === "labor"
-    ? base.laborAssets + (saved.realWage ?? INITIAL_REAL_WAGE) * diffSeconds / 3600
-    : base.laborAssets;
+  const result = {
+    ...base,
+    categoryTimes: nextTimes,
+    receiptHistory: { ...base.receiptHistory, [todayStr]: nextTimes },
+  };
+
+  // タスク別（アクティビティ・ToDo）にも加算
+  if (saved.activeActivityId) {
+    result.activityTimes = { ...base.activityTimes, [saved.activeActivityId]: (base.activityTimes[saved.activeActivityId] || 0) + diffSeconds };
+  }
+  if (saved.activeTodoId) {
+    result.todoTimes = { ...base.todoTimes, [saved.activeTodoId]: (base.todoTimes[saved.activeTodoId] || 0) + diffSeconds };
+  }
+
+  // 労働：労働資産を加算
+  if (cat === "labor") {
+    result.laborAssets = base.laborAssets + (saved.realWage ?? INITIAL_REAL_WAGE) * diffSeconds / 3600;
+  }
+
+  // 投資：ご褒美貯蓄・EXP（レベルアップ含む）・慣性ボーナスを継続加算
+  let levelUps = 0;
+  if (cat === "investment") {
+    const potWage = saved.potentialWage ?? saved.realWage ?? INITIAL_REAL_WAGE;
+    result.rewardSavings = base.rewardSavings + potWage * diffSeconds / 3600;
+    const permTotal = (saved.permanentBuffs ?? []).reduce((s, b) => s + (b.buffRate || 0), 0);
+    const baseMult = (1.0 + permTotal) * (saved.sleepBuffMult ?? 1.0);
+    const actMult = saved.activeActivityId ? ((saved.activityExpMults ?? {})[saved.activeActivityId] ?? 1.0) : 1.0;
+    result.exp = base.exp + integrateInvestExp(base.momentumSeconds, diffSeconds, baseMult, actMult);
+    let lv = base.level;
+    while (result.exp >= calculateRequiredExp(lv)) { lv++; levelUps++; }
+    result.level = lv;
+    result.momentumSeconds = base.momentumSeconds + diffSeconds;
+    result.lifetimeInvestSec = base.lifetimeInvestSec + diffSeconds;
+    const titles = new Set(base.unlockedTitles);
+    TITLE_MILESTONES.forEach(m => { if (m.threshold && result.lifetimeInvestSec >= m.threshold) titles.add(m.id); });
+    result.unlockedTitles = [...titles];
+  } else if (cat === "recovery") {
+    result.momentumSeconds = diffSeconds <= 600 ? base.momentumSeconds : 0;
+  } else {
+    result.momentumSeconds = 0;
+  }
+
+  // カレンダーへオフライン区間を反映（同一日・1分以上のみ）
+  if (toLocalDateStr(lastSeen) === todayStr && diffSeconds >= 60 && cat !== "reward_time") {
+    const startT = hhmmOf(lastSeen), endT = hhmmOf(now);
+    if (startT < endT) {
+      const actName = (() => {
+        if (saved.activeActivityId && saved.activities) {
+          const found = (saved.activities[cat] ?? []).find(a => a.id === saved.activeActivityId);
+          if (found) return found.name;
+        }
+        return { investment: "投資", labor: "労働", recovery: "回復", waste: "浪費" }[cat] ?? cat;
+      })();
+      let extended = false;
+      result.scheduleBlocks = base.scheduleBlocks.map(b => {
+        if (!extended && b.date === todayStr && b.category === cat && b.endTime <= endT && Math.abs(hhmmToMin(b.endTime) - hhmmToMin(startT)) <= 2) {
+          extended = true;
+          return { ...b, endTime: endT, isLive: false };
+        }
+        return b;
+      });
+      if (!extended) {
+        result.scheduleBlocks = [...result.scheduleBlocks, { id: `block_off_${Date.now()}`, date: todayStr, startTime: startT, endTime: endT, category: cat, activityId: saved.activeActivityId ?? "", activityName: actName, todos: [], isLive: false }];
+      }
+    }
+  }
 
   const fmtDiff = diffSeconds >= 3600
     ? `${Math.floor(diffSeconds / 3600)}時間${Math.floor((diffSeconds % 3600) / 60)}分`
     : `${Math.floor(diffSeconds / 60)}分`;
   const catLabel = { investment: "投資", labor: "労働", recovery: "回復", waste: "浪費" }[cat] ?? cat;
-
-  return {
-    categoryTimes: nextTimes,
-    receiptHistory: nextHistory,
-    laborAssets: nextLabor,
-    needsMorning: false,
-    offlineNotice: `📲 オフライン中の${fmtDiff}を「${catLabel}」に加算しました。`,
-  };
+  result.offlineNotice = `📲 オフライン中の${fmtDiff}を「${catLabel}」に加算しました。${levelUps > 0 ? ` 🎉 Lv.${result.level}にレベルアップ！` : ""}`;
+  return result;
 };
 
 const computeInitialState = () => computeOfflineDelta(loadLS());
@@ -421,10 +504,10 @@ function App() {
   const [reportPeriod, setReportPeriod] = useState("week");
 
   const [realWage, setRealWage] = useState(_ls?.realWage ?? INITIAL_REAL_WAGE);
-  const [level, setLevel] = useState(_ls?.level ?? 1);
-  const [exp, setExp] = useState(_ls?.exp ?? 0);
+  const [level, setLevel] = useState(_initState.level);
+  const [exp, setExp] = useState(_initState.exp);
   const [potentialWage, setPotentialWage] = useState(_ls?.potentialWage ?? INITIAL_REAL_WAGE);
-  const [rewardSavings, setRewardSavings] = useState(_ls?.rewardSavings ?? 0);
+  const [rewardSavings, setRewardSavings] = useState(_initState.rewardSavings);
   const [laborAssets, setLaborAssets] = useState(_initState.laborAssets);
   const [wageHistory, setWageHistory] = useState(_ls?.wageHistory ?? {});
   const [sentiment, setSentiment] = useState(_ls?.sentiment ?? 1.0);
@@ -435,10 +518,14 @@ function App() {
 
   const [activeCategory, setActiveCategory] = useState(_ls?.activeCategory ?? null);
   const [activeActivityId, setActiveActivityId] = useState(_ls?.activeActivityId ?? null);
-  const [activeTodoId, setActiveTodoId] = useState(null);
+  const [activeTodoId, setActiveTodoId] = useState(_ls?.activeTodoId ?? null);
 
   // ゲーミフィケーション強化
-  const [momentumSeconds, setMomentumSeconds] = useState(0);
+  const [momentumSeconds, setMomentumSeconds] = useState(_initState.momentumSeconds);
+  const momentumRef = useRef(_initState.momentumSeconds);
+  momentumRef.current = momentumSeconds;
+  // 称号判定用の累計投資秒数（日次リセットの影響を受けない）
+  const [lifetimeInvestSec, setLifetimeInvestSec] = useState(_initState.lifetimeInvestSec);
   const recoveryGraceRef = useRef(null);
   const [investStreak, setInvestStreak] = useState(_ls?.investStreak ?? 0);
   const [lastInvestDate, setLastInvestDate] = useState(_ls?.lastInvestDate ?? null);
@@ -464,10 +551,10 @@ function App() {
   const [missionDate, setMissionDate] = useState(_ls?.missionDate ?? null);
 
   // 称号・バッジ
-  const [unlockedTitles, setUnlockedTitles] = useState(_ls?.unlockedTitles ?? []);
+  const [unlockedTitles, setUnlockedTitles] = useState(_initState.unlockedTitles);
 
   // 週間チャレンジ
-  const getWeekStart = () => { const d = new Date(); d.setHours(0,0,0,0); d.setDate(d.getDate() - d.getDay() + 1); return d.toISOString().split("T")[0]; };
+  const getWeekStart = () => { const d = new Date(); d.setHours(0,0,0,0); d.setDate(d.getDate() - d.getDay() + 1); return toLocalDateStr(d); };
   const [weeklyClaimed, setWeeklyClaimed] = useState(_ls?.weeklyClaimed ?? {});
   const [weeklyDate, setWeeklyDate] = useState(_ls?.weeklyDate ?? null);
 
@@ -483,12 +570,14 @@ function App() {
   const [categoryTimes, setCategoryTimes] = useState(
     _initState.categoryTimes
   );
-  const [activityTimes, setActivityTimes] = useState(_ls?.activityTimes ?? {});
-  const [todoTimes, setTodoTimes] = useState(_ls?.todoTimes ?? {});
+  const [activityTimes, setActivityTimes] = useState(_initState.activityTimes);
+  const [todoTimes, setTodoTimes] = useState(_initState.todoTimes);
 
   const [activities, setActivities] = useState(
     _ls?.activities ? deserializeActivities(_ls.activities) : DEFAULT_ACTIVITIES
   );
+  const activitiesRef = useRef(null);
+  activitiesRef.current = activities;
   const [activityModal, setActivityModal] = useState({ isOpen: false, category: null });
   const [newActivityName, setNewActivityName] = useState("");
   const [newActivityIcon, setNewActivityIcon] = useState(() => Star);
@@ -503,7 +592,7 @@ function App() {
   const todoInputRef = useRef(null);
 
   const [selectedDate, setSelectedDate] = useState(today);
-  const [scheduleBlocks, setScheduleBlocks] = useState(_ls?.scheduleBlocks ?? []);
+  const [scheduleBlocks, setScheduleBlocks] = useState(_initState.scheduleBlocks);
   const [scheduleModal, setScheduleModal] = useState({ isOpen: false, id: null, startTime: "09:00", endTime: "10:00", category: "investment", activityId: "", activityName: "", todos: [] });
   const [activeOverlapAlert, setActiveOverlapAlert] = useState(null);
   const [offlineBlockAlert, setOfflineBlockAlert] = useState(null); // オフライン中のスケジュールブロック重複アラート
@@ -514,7 +603,7 @@ function App() {
     const d = new Date();
     return Array.from({ length: 7 }, (_, i) => {
       const dt = new Date(d); dt.setDate(d.getDate() - 3 + i);
-      return dt.toISOString().split("T")[0];
+      return toLocalDateStr(dt);
     });
   };
   const daysRange = getDaysRange();
@@ -600,6 +689,28 @@ function App() {
     }, 1000);
     return () => clearInterval(id);
   }, []);
+
+  // アプリを開いたままリセット時刻をまたいだらモーニングレシートを表示
+  const resetKeyRef = useRef(null);
+  useEffect(() => {
+    const keyOf = () => {
+      const [rh, rm] = (resetTime ?? "03:00").split(":").map(Number);
+      const n = new Date();
+      const r = new Date(n); r.setHours(rh, rm, 0, 0);
+      if (r > n) r.setDate(r.getDate() - 1);
+      return toLocalDateStr(r);
+    };
+    resetKeyRef.current = keyOf();
+    const id = setInterval(() => {
+      const k = keyOf();
+      if (k !== resetKeyRef.current) {
+        resetKeyRef.current = k;
+        const nowHHMM = getNowHHMM();
+        setMorningModal({ isOpen: true, bedTime: nowHHMM, wakeTime: nowHHMM, gapCategory: "recovery", sleepQuality: null, lastSeenAt: Date.now() });
+      }
+    }, 10000);
+    return () => clearInterval(id);
+  }, [resetTime]);
   const receiptSwipeRef = useRef(null);
   const swipeStartX = useRef(null);
   const swipeStartY = useRef(null);
@@ -616,7 +727,7 @@ function App() {
   // =========================================================
   // モーニングレシートモーダル
   // =========================================================
-  const [morningModal, setMorningModal] = useState({ isOpen: _initState.needsMorning, bedTime: "00:00", wakeTime: "07:00", gapCategory: "recovery", sleepQuality: null });
+  const [morningModal, setMorningModal] = useState({ isOpen: _initState.needsMorning, bedTime: "00:00", wakeTime: "07:00", gapCategory: "recovery", sleepQuality: null, lastSeenAt: _initState.morningLastSeen });
 
   const THEME_OPTIONS = [
     { id: "emerald", label: "エメラルド", color: "#10b981" },
@@ -702,9 +813,8 @@ function App() {
 
         // リアルタイムスケジュール反映
         if (activeCategory !== "reward_time") {
-          const allActs = Object.values(DEFAULT_ACTIVITIES).flat();
           const actName = (() => {
-            for (const [, list] of Object.entries(DEFAULT_ACTIVITIES)) {
+            for (const [, list] of Object.entries(activitiesRef.current)) {
               const found = list.find(a => a.id === activeActivityId);
               if (found) return found.name;
             }
@@ -739,12 +849,15 @@ function App() {
                 todos: [],
                 isLive: true,
               };
-              // 重複する既存liveブロックを除いて追加
-              return [...prev.filter(b => !b.isLive || b.id === (live?.id ?? "")), newBlock];
+              // 既存liveブロックは確定して記録として残す（0分のものは破棄）
+              const finalized = prev
+                .map(b => (b.isLive ? { ...b, isLive: false } : b))
+                .filter(b => !(String(b.id).startsWith("live_") && b.startTime === b.endTime));
+              return [...finalized, newBlock];
             }
-            // 同じブロックのendTimeだけ更新
+            // 同じブロックのendTimeだけ更新（リロード復帰後も同じidで伸ばし続ける）
             return prev.map(b =>
-              b.id === live.id ? { ...b, endTime: nowHHMM } : b
+              b.id === live.id ? { ...b, endTime: nowHHMM, isLive: true } : b
             );
           });
         }
@@ -757,9 +870,11 @@ function App() {
         if (activeActivityId) setActivityTimes(prev => ({ ...prev, [activeActivityId]: (prev[activeActivityId] || 0) + 1 }));
         if (activeTodoId) setTodoTimes(prev => ({ ...prev, [activeTodoId]: (prev[activeTodoId] || 0) + 1 }));
       } else {
-        // 活動停止時：liveブロックをクリア
+        // 活動停止時：liveブロックを確定して記録として残す（0分のものは破棄）
         if (liveBlockRef.current) {
-          setScheduleBlocks(prev => prev.filter(b => !b.isLive));
+          setScheduleBlocks(prev => prev
+            .map(b => (b.isLive ? { ...b, isLive: false } : b))
+            .filter(b => !(String(b.id).startsWith("live_") && b.startTime === b.endTime)));
           liveBlockRef.current = null;
         }
       }
@@ -819,12 +934,15 @@ function App() {
           return nextExp;
         });
         setRewardSavings(prev => prev + rewardGain);
-        // 称号チェック（投資累計時間ベース）
-        const totalInvestSec = (categoryTimes.investment || 0) + 1;
-        TITLE_MILESTONES.forEach(m => {
-          if (m.threshold && totalInvestSec >= m.threshold) {
-            setUnlockedTitles(prev => prev.includes(m.id) ? prev : [...prev, m.id]);
-          }
+        // 称号チェック（累計投資時間ベース・日次リセットの影響なし）
+        setLifetimeInvestSec(prevL => {
+          const next = prevL + 1;
+          TITLE_MILESTONES.forEach(m => {
+            if (m.threshold && next >= m.threshold) {
+              setUnlockedTitles(prev => prev.includes(m.id) ? prev : [...prev, m.id]);
+            }
+          });
+          return next;
         });
         // +EXP フローティングテキスト（5秒ごとに表示）
         if (Math.floor(Date.now() / 1000) % 5 === 0) {
@@ -916,7 +1034,7 @@ function App() {
 
     const tick = () => {
       const current = loadLS();
-      if (current) saveLS({ ...current, activeCategory, activeActivityId, lastSeenAt: Date.now() });
+      if (current) saveLS({ ...current, activeCategory, activeActivityId, activeTodoId, momentumSeconds: momentumRef.current, lastSeenAt: Date.now() });
     };
 
     const startTicking = () => {
@@ -938,11 +1056,20 @@ function App() {
         const saved = loadLS();
         const result = computeOfflineDelta(saved);
         if (result.needsMorning) {
-          setMorningModal({ isOpen: true, bedTime: "00:00", wakeTime: "07:00", gapCategory: "recovery" });
+          setMorningModal({ isOpen: true, bedTime: "00:00", wakeTime: "07:00", gapCategory: "recovery", sleepQuality: null, lastSeenAt: result.morningLastSeen });
         } else {
           setCategoryTimes(result.categoryTimes);
+          setActivityTimes(result.activityTimes);
+          setTodoTimes(result.todoTimes);
           setReceiptHistory(result.receiptHistory);
           setLaborAssets(result.laborAssets);
+          setRewardSavings(result.rewardSavings);
+          setExp(result.exp);
+          setLevel(result.level);
+          setMomentumSeconds(result.momentumSeconds);
+          setLifetimeInvestSec(result.lifetimeInvestSec);
+          setUnlockedTitles(result.unlockedTitles);
+          setScheduleBlocks(result.scheduleBlocks);
           if (result.offlineNotice) setNotification(result.offlineNotice);
         }
         // 加算済みなので時刻をリセットしてから再び計測開始
@@ -959,7 +1086,7 @@ function App() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("pagehide", tick);
     };
-  }, [activeCategory, activeActivityId]);
+  }, [activeCategory, activeActivityId, activeTodoId]);
 
   // =========================================================
   // localStorage への永続保存（主要 state が変わるたびに保存）
@@ -971,10 +1098,12 @@ function App() {
     saveLS({
       ...(existing || {}),
       realWage, level, exp, potentialWage, rewardSavings, laborAssets,
-      activeCategory, activeActivityId,
+      activeCategory, activeActivityId, activeTodoId,
+      momentumSeconds: momentumRef.current,
+      lifetimeInvestSec,
       categoryTimes, activityTimes, todoTimes,
       activities: serializeActivities(activities),
-      todos, scheduleBlocks: scheduleBlocks.filter(b => !b.isLive),
+      todos, scheduleBlocks: scheduleBlocks.map(b => (b.isLive ? { ...b, isLive: false } : b)),
       shopItems, inventory,
       favoriteInvestments, permanentBuffs,
       receiptHistory,
@@ -989,7 +1118,7 @@ function App() {
     });
   }, [
     realWage, level, exp, potentialWage, rewardSavings, laborAssets,
-    activeCategory, activeActivityId,
+    activeCategory, activeActivityId, activeTodoId, lifetimeInvestSec,
     categoryTimes, activityTimes, todoTimes,
     activities, todos, scheduleBlocks,
     shopItems, inventory,
@@ -1076,42 +1205,59 @@ function App() {
     if (!saved) { setMorningModal(prev => ({ ...prev, isOpen: false })); return; }
 
     const now = new Date();
-    const lastSeen = new Date(saved.lastSeenAt);
+    // モーダルが開いた時点で保全しておいた「最後に見ていた時刻」を使う
+    // （起動直後にlastSeenAtが上書きされる問題への対策）
+    const lastSeenRaw = morningModal.lastSeenAt ?? saved.lastSeenAt;
     const [bh, bm] = bedTime.split(":").map(Number);
     const [wh, wm] = wakeTime.split(":").map(Number);
 
-    // 就寝時刻（Date）
-    const bedDate = new Date(now); bedDate.setHours(bh, bm, 0, 0);
-    if (bedDate > now) bedDate.setDate(bedDate.getDate() - 1);
+    // 直近のリセット時刻（この時点を境に前日/今日へ分割する）
+    const [rh, rm] = (resetTime ?? "03:00").split(":").map(Number);
+    const resetMoment = new Date(now); resetMoment.setHours(rh, rm, 0, 0);
+    if (resetMoment > now) resetMoment.setDate(resetMoment.getDate() - 1);
+    const todayKey = toLocalDateStr(resetMoment);
+    const yestStr = toLocalDateStr(new Date(resetMoment.getTime() - 86400000));
 
     // 起床時刻（Date）
     const wakeDate = new Date(now); wakeDate.setHours(wh, wm, 0, 0);
     if (wakeDate > now) wakeDate.setDate(wakeDate.getDate() - 1);
+    // 就寝時刻（Date）：起床より前になるよう補正
+    const bedDate = new Date(wakeDate); bedDate.setHours(bh, bm, 0, 0);
+    if (bedDate > wakeDate) bedDate.setDate(bedDate.getDate() - 1);
+    const lastSeen = new Date(Math.min(lastSeenRaw ?? now.getTime(), bedDate.getTime()));
 
-    // ① アプリを閉じた時刻 → 就寝時刻：閉じた時のカテゴリに加算（前日分）
-    const gapToSleepSec = Math.max(0, Math.floor((bedDate - lastSeen) / 1000));
-    // ② 就寝 → 起床：回復（睡眠）に加算（前日分）
-    const sleepSec = Math.max(0, Math.floor((wakeDate - bedDate) / 1000));
-    // ③ 起床 → アプリ起動：選択カテゴリに加算（今日分）
-    const gapFromWakeSec = Math.max(0, Math.floor((now - wakeDate) / 1000));
-
-    // 前日の receiptHistory に加算
-    const yestStr = new Date(now.getTime() - 86400000).toISOString().split("T")[0];
-    setReceiptHistory(h => {
-      const prev = h[yestStr] || { investment: 0, labor: 0, recovery: 0, waste: 0 };
-      const prevCat = saved.activeCategory ?? "waste";
+    // 各区間をリセット時刻で「前日分」「今日分」に分割
+    const splitAtReset = (a, b) => {
+      if (b <= a) return { before: 0, after: 0 };
       return {
-        ...h,
-        [yestStr]: {
-          ...prev,
-          [prevCat]: (prev[prevCat] || 0) + gapToSleepSec,
-          recovery: (prev.recovery || 0) + sleepSec,
-        },
-        [getTodayStr()]: {
-          ...(h[getTodayStr()] || { investment: 0, labor: 0, recovery: 0, waste: 0 }),
-          [gapCategory]: ((h[getTodayStr()]?.[gapCategory]) || 0) + gapFromWakeSec,
-        },
+        before: Math.max(0, Math.floor((Math.min(b, resetMoment) - a) / 1000)),
+        after: Math.max(0, Math.floor((b - Math.max(a, resetMoment)) / 1000)),
       };
+    };
+    // ① アプリを閉じた時刻 → 就寝：閉じた時のカテゴリに加算
+    const gapS = splitAtReset(lastSeen, bedDate);
+    // ② 就寝 → 起床：回復（睡眠）に加算
+    const sleepS = splitAtReset(bedDate, wakeDate);
+    // ③ 起床 → アプリ起動：選択カテゴリに加算
+    const wakeS = splitAtReset(wakeDate, now);
+    const sleepSec = sleepS.before + sleepS.after;
+
+    const prevCat = saved.activeCategory ?? "waste";
+    const zeroTimes = { investment: 0, labor: 0, recovery: 0, waste: 0, reward_time: 0 };
+
+    // 今日のカテゴリ時間をゼロから再構築（＝日次リセット）
+    const freshTimes = { ...zeroTimes };
+    freshTimes[prevCat] = (freshTimes[prevCat] || 0) + gapS.after;
+    freshTimes.recovery += sleepS.after;
+    freshTimes[gapCategory] = (freshTimes[gapCategory] || 0) + wakeS.after;
+    setCategoryTimes(freshTimes);
+
+    setReceiptHistory(h => {
+      const yNew = { ...zeroTimes, ...(h[yestStr] || {}) };
+      yNew[prevCat] = (yNew[prevCat] || 0) + gapS.before;
+      yNew.recovery += sleepS.before;
+      yNew[gapCategory] = (yNew[gapCategory] || 0) + wakeS.before;
+      return { ...h, [yestStr]: yNew, [todayKey]: { ...freshTimes } };
     });
 
     // ===== 市場評価S（2層モデル）の日次更新 =====
@@ -1137,25 +1283,28 @@ function App() {
     // 前日の市場価値（実力 × その日の終値）を記録
     setWageHistory(h => ({ ...h, [yestStr]: Math.floor(potentialWage * yCloseS) }));
 
-    // 今日分のcategoryTimesにも反映
-    setCategoryTimes(prev => ({
-      ...prev,
-      [gapCategory]: (prev[gapCategory] || 0) + gapFromWakeSec,
-    }));
+    // 新しい1日はトラッキング停止状態から開始
+    setActiveCategory(null);
+    setActiveActivityId(null);
+    setActiveTodoId(null);
+    setMomentumSeconds(0);
+    // lastSeenAt等を即時更新して二重精算を防ぐ
+    saveLS({ ...saved, lastSeenAt: Date.now(), activeCategory: null, activeActivityId: null, activeTodoId: null, momentumSeconds: 0 });
 
     // 睡眠バフ判定（体感4択があればそちら優先、なければ睡眠時間で算出）
     const sleepHours = sleepSec / 3600;
     let sleepBuff = "";
     let sleepMult = 1.0;
-    if (morningModal.sleepQuality !== null) {
-      const qualityMap = {
-        great: { mult: 1.1, msg: "😴 ぐっすり眠れた！本日のEXP ×1.1" },
-        ok:    { mult: 1.0, msg: "" },
-        poor:  { mult: 0.9, msg: "😪 睡眠浅め…本日のEXP ×0.9" },
-        bad:   { mult: 0.7, msg: "💀 最悪の睡眠…本日のEXP ×0.7" },
-      };
-      sleepMult = qualityMap[morningModal.sleepQuality].mult;
-      sleepBuff = qualityMap[morningModal.sleepQuality].msg;
+    const qualityMap = {
+      great: { mult: 1.1, msg: "😴 ぐっすり眠れた！本日のEXP ×1.1" },
+      ok:    { mult: 1.0, msg: "" },
+      poor:  { mult: 0.9, msg: "😪 睡眠浅め…本日のEXP ×0.9" },
+      bad:   { mult: 0.7, msg: "💀 最悪の睡眠…本日のEXP ×0.7" },
+    };
+    const quality = qualityMap[morningModal.sleepQuality];
+    if (quality) {
+      sleepMult = quality.mult;
+      sleepBuff = quality.msg;
     } else {
       if (sleepHours >= 9) { sleepMult = 1.0; }
       else if (sleepHours >= 7) { sleepMult = 1.1; sleepBuff = "😴 快眠バフ発動！本日のEXP ×1.1"; }
@@ -1167,7 +1316,7 @@ function App() {
     const thisWeek = getWeekStart();
     if (weeklyDate !== thisWeek) { setWeeklyDate(thisWeek); setWeeklyClaimed({}); }
     // デイリーミッションを今日付けでリセット
-    setMissionDate(getTodayStr());
+    setMissionDate(todayKey);
     setMissionClaimed({});
 
     setMorningModal(prev => ({ ...prev, isOpen: false }));
@@ -1288,7 +1437,7 @@ function App() {
     setLaborAssets(prev => prev - amount);
     if (amount >= 50000) {
       const buffRate = Math.min(0.25, parseFloat((amount * 0.000001).toFixed(3)));
-      setPermanentBuffs(prev => [{ id: `perm_${Date.now()}`, name, amount, buffRate, date: new Date().toISOString().split("T")[0] }, ...prev]);
+      setPermanentBuffs(prev => [{ id: `perm_${Date.now()}`, name, amount, buffRate, date: getTodayStr() }, ...prev]);
       setNotification(`👑 5万円以上の自己投資！ 永続バフ「${name}」発動！ (EXP +${Math.round(buffRate * 100)}%)`);
     } else {
       let multiplier = 1.5;
@@ -1365,8 +1514,9 @@ function App() {
       setNotification("⚠️ その時間帯は他の予定と重複しています。");
       return;
     }
-    if (id) { setScheduleBlocks(prev => prev.map(b => b.id === id ? { ...b, ...scheduleModal } : b)); }
-    else { setScheduleBlocks(prev => [...prev, { id: `block_${Date.now()}`, date: selectedDate, ...scheduleModal }]); }
+    const { isOpen: _o, id: _mid, ...blockData } = scheduleModal;
+    if (id) { setScheduleBlocks(prev => prev.map(b => b.id === id ? { ...b, ...blockData } : b)); }
+    else { setScheduleBlocks(prev => [...prev, { ...blockData, id: `block_${Date.now()}`, date: selectedDate, isLive: false }]); }
     setScheduleModal(prev => ({ ...prev, isOpen: false }));
   };
   const [deleteConfirm, setDeleteConfirm] = useState(false);
@@ -2475,8 +2625,8 @@ function App() {
               // 実データ集計
               const allDates = Object.keys(receiptHistory).sort();
               const today = getTodayStr();
-              const last7 = allDates.filter(d => d >= (() => { const dt = new Date(); dt.setDate(dt.getDate() - 6); return dt.toISOString().split("T")[0]; })()).slice(-7);
-              const last30 = allDates.filter(d => d >= (() => { const dt = new Date(); dt.setDate(dt.getDate() - 29); return dt.toISOString().split("T")[0]; })());
+              const last7 = allDates.filter(d => d >= (() => { const dt = new Date(); dt.setDate(dt.getDate() - 6); return toLocalDateStr(dt); })()).slice(-7);
+              const last30 = allDates.filter(d => d >= (() => { const dt = new Date(); dt.setDate(dt.getDate() - 29); return toLocalDateStr(dt); })());
               const periodDates = reportPeriod === "week" ? last7 : reportPeriod === "month" ? last30 : allDates;
 
               const sumField = (dates, field) => dates.reduce((acc, d) => acc + (receiptHistory[d]?.[field] ?? 0), 0);
@@ -2701,7 +2851,7 @@ function App() {
                   const startDate = new Date(endDate); startDate.setDate(endDate.getDate() - 55);
                   const days = [];
                   for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-                    days.push(d.toISOString().split("T")[0]);
+                    days.push(toLocalDateStr(d));
                   }
                   const maxInvest = Math.max(...days.map(d => (receiptHistory[d]?.investment ?? 0) / 3600), 1);
                   const getColor = (h) => {
@@ -2919,7 +3069,7 @@ function App() {
                       <button onClick={() => setPrestigeConfirmStep(0)} className="py-2.5 rounded-xl bg-zinc-800 text-zinc-400 text-xs font-bold border border-zinc-700">やめる</button>
                       <button onClick={() => {
                         setRealWage(potentialWage); setLevel(1); setExp(0);
-                        setPermanentBuffs(prev => [...prev, { id: `prestige_${Date.now()}`, name: `前世の称号 (Lv.${level})`, amount: 0, buffRate: 0.1, date: new Date().toISOString().split("T")[0] }]);
+                        setPermanentBuffs(prev => [...prev, { id: `prestige_${Date.now()}`, name: `前世の称号 (Lv.${level})`, amount: 0, buffRate: 0.1, date: getTodayStr() }]);
                         setPrestigeConfirmStep(0);
                         setNotification("🌟 転生成功！永続EXPバフ+10%を引き継ぎました！");
                         setTimeout(() => setActiveTab("home"), 600);
